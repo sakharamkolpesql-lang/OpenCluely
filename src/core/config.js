@@ -39,9 +39,10 @@ class ConfigManager {
       },
 
       llm: {
+        provider: process.env.LLM_PROVIDER || 'gemini',
         gemini: {
-          model: 'gemini-3.1-flash-lite',
-          fallbackModels: ['gemini-2.5-flash-lite', 'gemini-3.5-flash'],
+          model: 'gemini-2.5-flash',
+          fallbackModels: ['gemini-2.0-flash'],
           maxRetries: 3,
           timeout: 30000,
           fallbackEnabled: true,
@@ -52,6 +53,15 @@ class ConfigManager {
             topP: 0.9,
             maxOutputTokens: 4096,
             thinkingConfig: { thinkingBudget: 0 }
+          }
+        },
+        openai: {
+          maxRetries: 3,
+          timeout: 30000,
+          fallbackEnabled: true,
+          generation: {
+            temperature: 0.7,
+            maxOutputTokens: 4096
           }
         }
       },
@@ -119,6 +129,10 @@ class ConfigManager {
   getApiKey(service) {
     const envKey = `${service.toUpperCase()}_API_KEY`;
     return process.env[envKey];
+  }
+
+  setEnv(key, value) {
+    process.env[key] = value;
   }
 
   isFeatureEnabled(feature) {

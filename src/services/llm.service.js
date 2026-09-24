@@ -2,42 +2,69 @@ const { GoogleGenAI } = require('@google/genai');
 const logger = require('../core/logger').createServiceLogger('LLM');
 const config = require('../core/config');
 const { promptLoader } = require('../../prompt-loader');
+const providers = require('../core/providers');
 
 class LLMService {
   constructor() {
     this.client = null;
     this.model = null;
+    this.providerId = null;
     this.isInitialized = false;
     this.requestCount = 0;
     this.errorCount = 0;
-    
+
     this.initializeClient();
   }
 
+  get activeProvider() {
+    return providers.getActiveProviderId();
+  }
+
   initializeClient() {
-    const apiKey = config.getApiKey('GEMINI');
-    
+    const providerId = this.activeProvider;
+    this.providerId = providerId;
+    const provider = providers.getProvider(providerId);
+
+    if (!provider) {
+      logger.warn('Unknown LLM provider', { providerId });
+      return;
+    }
+
+    const apiKey = providers.getApiKey(providerId);
+
     if (!apiKey || apiKey === 'your-api-key-here') {
-      logger.warn('Gemini API key not configured', { 
-        keyExists: !!apiKey,
-        isPlaceholder: apiKey === 'your-api-key-here'
+      logger.warn('API key not configured for provider', {
+        provider: providerId,
+        keyExists: !!apiKey
       });
       return;
     }
 
-    try {
-      this.client = new GoogleGenAI({ apiKey });
-      
-      // Use the configured model name (default: gemini-3.5-flash)
-      this.model = config.get('llm.gemini.model');
+    if (provider.apiType === 'gemini') {
+      try {
+        this.client = new GoogleGenAI({ apiKey });
+        this.model = providers.getActiveModel(providerId);
+        this.isInitialized = true;
+
+        logger.info('Gemini AI client initialized successfully', {
+          provider: providerId,
+          model: this.model
+        });
+      } catch (error) {
+        logger.error('Failed to initialize Gemini client', {
+          error: error.message
+        });
+      }
+    } else {
+      // OpenAI-compatible providers (Groq, OpenRouter, OpenAI, etc.)
+      this.client = null;
+      this.model = providers.getActiveModel(providerId);
       this.isInitialized = true;
-      
-      logger.info('Gemini AI client initialized successfully', {
-        model: this.model
-      });
-    } catch (error) {
-      logger.error('Failed to initialize Gemini client', { 
-        error: error.message 
+
+      logger.info('OpenAI-compatible provider initialized', {
+        provider: providerId,
+        model: this.model,
+        baseURL: provider.baseURL
       });
     }
   }
@@ -302,54 +329,258 @@ class LLMService {
     return `Analyze this image for a ${activeSkill.toUpperCase()} question. Extract the problem concisely and provide the best possible solution with explanation and final code.${langNote}`;
   }
 
+  _isGeminiProvider() {
+    return this.activeProvider === 'gemini';
+  }
+
+  _buildOpenAIMessages(systemPrompt, userText, conversationHistory = [], multimodal = false) {
+    const messages = [];
+    if (systemPrompt && systemPrompt.trim()) {
+      messages.push({ role: 'system', content: systemPrompt });
+    }
+    for (const event of conversationHistory) {
+      if (event.role === 'system' || !event.content || typeof event.content !== 'string' || !event.content.trim()) continue;
+      messages.push({
+        role: event.role === 'model' ? 'assistant' : 'user',
+        content: event.content.trim()
+      });
+    }
+    if (multimodal) {
+      messages.push({ role: 'user', content: [{ type: 'text', text: userText }] });
+    } else {
+      messages.push({ role: 'user', content: userText });
+    }
+    return messages;
+  }
+
+  async executeOpenAIRequest(messages) {
+    const provider = providers.getProvider(this.activeProvider);
+    const model = this.model || provider.defaultModel;
+    const maxRetries = config.get('llm.openai.maxRetries') || 3;
+    const timeout = config.get('llm.openai.timeout') || 30000;
+    const genConfig = config.get('llm.openai.generation') || {};
+    const apiKey = providers.getApiKey(this.activeProvider);
+
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const responseText = await this._openAIHTTPSRequest({
+          baseURL: provider.baseURL,
+          apiKey,
+          model,
+          messages,
+          temperature: genConfig.temperature ?? 0.7,
+          max_tokens: genConfig.maxOutputTokens ?? 4096,
+          stream: false,
+          timeout
+        });
+
+        logger.debug('OpenAI-compatible request successful', {
+          provider: this.activeProvider,
+          model,
+          attempt,
+          responseLength: responseText.length
+        });
+
+        return responseText;
+      } catch (error) {
+        lastError = error;
+        logger.warn(`OpenAI-compatible request attempt ${attempt} failed`, {
+          provider: this.activeProvider,
+          model,
+          error: error.message
+        });
+        if (attempt < maxRetries) {
+          const delay = 1500 * attempt + Math.random() * 1000;
+          await this.delay(delay);
+        }
+      }
+    }
+    throw lastError || new Error('OpenAI-compatible request failed');
+  }
+
+  async executeOpenAIStreamingRequest(messages, onDelta) {
+    const provider = providers.getProvider(this.activeProvider);
+    const model = this.model || provider.defaultModel;
+    const maxRetries = config.get('llm.openai.maxRetries') || 3;
+    const timeout = config.get('llm.openai.timeout') || 30000;
+    const genConfig = config.get('llm.openai.generation') || {};
+    const apiKey = providers.getApiKey(this.activeProvider);
+
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const fullText = await this._openAIHTTPSRequest({
+          baseURL: provider.baseURL,
+          apiKey,
+          model,
+          messages,
+          temperature: genConfig.temperature ?? 0.7,
+          max_tokens: genConfig.maxOutputTokens ?? 4096,
+          stream: true,
+          timeout,
+          onDelta
+        });
+
+        logger.debug('OpenAI-compatible streaming request successful', {
+          provider: this.activeProvider,
+          model,
+          attempt,
+          responseLength: fullText.length
+        });
+
+        return fullText;
+      } catch (error) {
+        lastError = error;
+        logger.warn(`OpenAI-compatible streaming attempt ${attempt} failed`, {
+          provider: this.activeProvider,
+          model,
+          error: error.message
+        });
+        if (attempt < maxRetries) {
+          const delay = 1500 * attempt + Math.random() * 1000;
+          await this.delay(delay);
+        }
+      }
+    }
+    throw lastError || new Error('OpenAI-compatible streaming request failed');
+  }
+
+  _openAIHTTPSRequest({ baseURL, apiKey, model, messages, temperature, max_tokens, stream, timeout, onDelta }) {
+    const https = require('https');
+    const url = new URL('/chat/completions', baseURL);
+    const body = JSON.stringify({ model, messages, temperature, max_tokens, stream });
+    const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Length': Buffer.byteLength(body),
+      'User-Agent': this.getUserAgent()
+    };
+    if (this.activeProvider === 'openrouter') {
+      headers['X-Title'] = 'OpenCluely';
+      headers['HTTP-Referer'] = 'https://github.com/OpenCluely';
+    }
+
+    const options = {
+      method: 'POST',
+      headers,
+      timeout,
+      agent
+    };
+
+    return new Promise((resolve, reject) => {
+      const req = https.request(url, options, (res) => {
+        if (res.statusCode !== 200) {
+          let errBody = '';
+          res.on('data', (c) => { errBody += c; });
+          res.on('end', () => reject(new Error(`HTTP ${res.statusCode}: ${errBody}`)));
+          return;
+        }
+
+        let fullText = '';
+        let buffer = '';
+
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => {
+          if (!stream) {
+            buffer += chunk;
+            return;
+          }
+          buffer += chunk;
+          let idx;
+          while ((idx = buffer.indexOf('\n')) !== -1) {
+            const line = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx + 1);
+            if (!line.startsWith('data:')) continue;
+            const payload = line.slice(5).trim();
+            if (!payload || payload === '[DONE]') continue;
+            try {
+              const json = JSON.parse(payload);
+              const delta = json.choices?.[0]?.delta?.content || '';
+              if (delta) {
+                fullText += delta;
+                if (typeof onDelta === 'function') onDelta(delta);
+              }
+            } catch (_) { /* skip partial JSON */ }
+          }
+        });
+
+        res.on('end', () => {
+          if (!stream) {
+            try {
+              const json = JSON.parse(buffer);
+              const content = json.choices?.[0]?.message?.content || '';
+              resolve(content.trim());
+            } catch (e) {
+              reject(new Error(`Failed to parse response: ${e.message}`));
+            }
+            return;
+          }
+          resolve(fullText.trim());
+        });
+
+        res.on('error', (error) => reject(new Error(`Response error: ${error.message}`)));
+      });
+
+      req.on('error', (error) => reject(new Error(`Request failed: ${error.message}`)));
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error('Request timeout'));
+      });
+
+      req.write(body);
+      req.end();
+    });
+  }
+
   async processTextWithSkill(text, activeSkill, sessionMemory = [], programmingLanguage = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check API key configuration for the active provider.');
     }
 
     const startTime = Date.now();
     this.requestCount++;
-    
+
     try {
       logger.info('Processing text with LLM', {
         activeSkill,
         textLength: text.length,
         hasSessionMemory: sessionMemory.length > 0,
         programmingLanguage: programmingLanguage || 'not specified',
-        requestId: this.requestCount
+        requestId: this.requestCount,
+        provider: this.activeProvider
       });
 
-      const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
-
-      const preferAlternative = !!config.get('llm.gemini.enableFallbackMethod');
       let response;
-      try {
-        if (preferAlternative) {
-          logger.debug('Attempting alternative HTTPS method first for text processing');
-          response = await this.executeAlternativeRequest(geminiRequest);
-        } else {
-          response = await this.executeRequest(geminiRequest);
-        }
-      } catch (error) {
-        const secondaryLabel = preferAlternative ? 'primary SDK method' : 'alternative HTTPS method';
-        logger.warn(`${preferAlternative ? 'Alternative' : 'Primary'} method failed, trying ${secondaryLabel}`, {
-          error: error.message,
-          requestId: this.requestCount
-        });
-        const secondaryFn = preferAlternative ? this.executeRequest.bind(this) : this.executeAlternativeRequest.bind(this);
+
+      if (this._isGeminiProvider()) {
+        const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
+        const preferAlternative = !!config.get('llm.gemini.enableFallbackMethod');
         try {
+          if (preferAlternative) {
+            response = await this.executeAlternativeRequest(geminiRequest);
+          } else {
+            response = await this.executeRequest(geminiRequest);
+          }
+        } catch (error) {
+          const secondaryFn = preferAlternative ? this.executeRequest.bind(this) : this.executeAlternativeRequest.bind(this);
           response = await secondaryFn(geminiRequest);
-        } catch (secondaryError) {
-          logger.error('Both Gemini request methods failed for text processing', {
-            firstError: error.message,
-            secondError: secondaryError.message,
-            requestId: this.requestCount
-          });
-          throw secondaryError;
         }
+      } else {
+        const sessionManager = require('../managers/session.manager');
+        let conversationHistory = [];
+        let skillPrompt = '';
+        if (sessionManager && typeof sessionManager.getConversationHistory === 'function') {
+          conversationHistory = sessionManager.getConversationHistory(15);
+          const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage);
+          skillPrompt = skillContext.skillPrompt || '';
+        }
+        const messages = this._buildOpenAIMessages(skillPrompt, this.formatUserMessage(text, activeSkill), conversationHistory);
+        response = await this.executeOpenAIRequest(messages);
       }
-      
-      // Enforce language in code fences if programmingLanguage specified
+
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(response, programmingLanguage)
         : response;
@@ -391,20 +622,34 @@ class LLMService {
 
   async processTextWithSkillStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check API key configuration for the active provider.');
     }
 
     const startTime = Date.now();
     this.requestCount++;
 
     try {
-      const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
+      let fullText;
 
-      const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
-        if (typeof onDelta === 'function' && delta) {
-          onDelta(delta);
+      if (this._isGeminiProvider()) {
+        const geminiRequest = this.buildGeminiRequest(text, activeSkill, sessionMemory, programmingLanguage);
+        fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
+          if (typeof onDelta === 'function' && delta) {
+            onDelta(delta);
+          }
+        });
+      } else {
+        const sessionManager = require('../managers/session.manager');
+        let conversationHistory = [];
+        let skillPrompt = '';
+        if (sessionManager && typeof sessionManager.getConversationHistory === 'function') {
+          conversationHistory = sessionManager.getConversationHistory(15);
+          const skillContext = sessionManager.getSkillContext(activeSkill, programmingLanguage);
+          skillPrompt = skillContext.skillPrompt || '';
         }
-      });
+        const messages = this._buildOpenAIMessages(skillPrompt, this.formatUserMessage(text, activeSkill), conversationHistory);
+        fullText = await this.executeOpenAIStreamingRequest(messages, onDelta);
+      }
 
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
@@ -439,7 +684,7 @@ class LLMService {
 
   async processTranscriptionWithIntelligentResponse(text, activeSkill, sessionMemory = [], programmingLanguage = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check API key configuration for the active provider.');
     }
 
     const startTime = Date.now();
@@ -451,37 +696,34 @@ class LLMService {
         textLength: text.length,
         hasSessionMemory: sessionMemory.length > 0,
         programmingLanguage: programmingLanguage || 'not specified',
-        requestId: this.requestCount
+        requestId: this.requestCount,
+        provider: this.activeProvider
       });
 
-      const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage);
-
-      const preferAlternative = !!config.get('llm.gemini.enableFallbackMethod');
       let response;
-      try {
-        if (preferAlternative) {
-          logger.debug('Attempting alternative HTTPS method first for transcription processing');
-          response = await this.executeAlternativeRequest(geminiRequest);
-        } else {
-          response = await this.executeRequest(geminiRequest);
-        }
-      } catch (error) {
-        const secondaryLabel = preferAlternative ? 'primary SDK method' : 'alternative HTTPS method';
-        logger.warn(`${preferAlternative ? 'Alternative' : 'Primary'} method failed, trying ${secondaryLabel}`, {
-          error: error.message,
-          requestId: this.requestCount
-        });
-        const secondaryFn = preferAlternative ? this.executeRequest.bind(this) : this.executeAlternativeRequest.bind(this);
+
+      if (this._isGeminiProvider()) {
+        const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage);
+        const preferAlternative = !!config.get('llm.gemini.enableFallbackMethod');
         try {
+          if (preferAlternative) {
+            response = await this.executeAlternativeRequest(geminiRequest);
+          } else {
+            response = await this.executeRequest(geminiRequest);
+          }
+        } catch (error) {
+          const secondaryFn = preferAlternative ? this.executeRequest.bind(this) : this.executeAlternativeRequest.bind(this);
           response = await secondaryFn(geminiRequest);
-        } catch (secondaryError) {
-          logger.error('Both Gemini request methods failed for transcription processing', {
-            firstError: error.message,
-            secondError: secondaryError.message,
-            requestId: this.requestCount
-          });
-          throw secondaryError;
         }
+      } else {
+        const sessionManager = require('../managers/session.manager');
+        let conversationHistory = [];
+        if (sessionManager && typeof sessionManager.getConversationHistory === 'function') {
+          conversationHistory = sessionManager.getConversationHistory(10);
+        }
+        const intelligentPrompt = this.getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage);
+        const messages = this._buildOpenAIMessages(intelligentPrompt, text, conversationHistory);
+        response = await this.executeOpenAIRequest(messages);
       }
       
       // Enforce language in code fences if programmingLanguage specified
@@ -980,20 +1222,32 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
    */
   async processTranscriptionWithIntelligentResponseStream(text, activeSkill, sessionMemory = [], programmingLanguage = null, onDelta = null) {
     if (!this.isInitialized) {
-      throw new Error('LLM service not initialized. Check Gemini API key configuration.');
+      throw new Error('LLM service not initialized. Check API key configuration for the active provider.');
     }
 
     const startTime = Date.now();
     this.requestCount++;
 
     try {
-      const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage);
+      let fullText;
 
-      const fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
-        if (typeof onDelta === 'function' && delta) {
-          onDelta(delta);
+      if (this._isGeminiProvider()) {
+        const geminiRequest = this.buildIntelligentTranscriptionRequest(text, activeSkill, sessionMemory, programmingLanguage);
+        fullText = await this.executeStreamingRequest(geminiRequest, (delta) => {
+          if (typeof onDelta === 'function' && delta) {
+            onDelta(delta);
+          }
+        });
+      } else {
+        const sessionManager = require('../managers/session.manager');
+        let conversationHistory = [];
+        if (sessionManager && typeof sessionManager.getConversationHistory === 'function') {
+          conversationHistory = sessionManager.getConversationHistory(10);
         }
-      });
+        const intelligentPrompt = this.getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage);
+        const messages = this._buildOpenAIMessages(intelligentPrompt, text, conversationHistory);
+        fullText = await this.executeOpenAIStreamingRequest(messages, onDelta);
+      }
 
       const finalResponse = programmingLanguage
         ? this.enforceProgrammingLanguage(fullText, programmingLanguage)
@@ -1395,89 +1649,118 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     }
 
     try {
-      // First check network connectivity
-      const networkCheck = await this.checkNetworkConnectivity();
-      const hasNetworkIssues = networkCheck.tests.some(test => !test.success);
-      
-      if (hasNetworkIssues) {
-        logger.warn('Network connectivity issues detected', networkCheck);
+      if (this._isGeminiProvider()) {
+        return await this._testGeminiConnection();
+      } else {
+        return await this._testOpenAIConnection();
       }
-
-      const generationConfig = this.getGenerationConfig({ temperature: 0, maxOutputTokens: 64 });
-      const fallbackModels = config.get('llm.gemini.fallbackModels') || [];
-      const modelsToTry = [this.model, ...fallbackModels];
-
-      let lastError = null;
-      let result = null;
-      let usedModel = null;
-
-      for (const modelName of modelsToTry) {
-        try {
-          const startTime = Date.now();
-          result = await this.client.models.generateContent({
-            model: modelName,
-            contents: 'Test connection. Please respond with "OK".',
-            config: generationConfig
-          });
-          usedModel = modelName;
-          const latency = Date.now() - startTime;
-          const { text } = this.extractTextFromCandidates(result);
-
-          logger.info('Connection test successful', {
-            response: text,
-            latency,
-            model: usedModel,
-            networkCheck: hasNetworkIssues ? 'issues_detected' : 'healthy'
-          });
-
-          return {
-            success: true,
-            response: text,
-            latency,
-            model: usedModel,
-            networkConnectivity: networkCheck
-          };
-        } catch (error) {
-          lastError = error;
-          logger.warn(`Connection test failed for model ${modelName}`, {
-            error: error.message,
-            model: modelName
-          });
-
-          const isModelUnavailable = error.message.includes('503') ||
-            error.message.includes('UNAVAILABLE') ||
-            error.message.includes('high demand') ||
-            error.message.includes('quota') ||
-            error.message.includes('rate limit');
-
-          if (!isModelUnavailable && modelName === this.model) {
-            // Primary model failed for a non-availability reason; don't hide it
-            break;
-          }
-        }
-      }
-
-      throw lastError || new Error('Connection test failed on all models');
     } catch (error) {
       const errorAnalysis = this.analyzeError(error);
       logger.error('Connection test failed', {
         error: error.message,
-        errorAnalysis
+        errorAnalysis,
+        provider: this.activeProvider
       });
-
-      // Map raw SDK errors to user-friendly messages. The wizard only
-      // surfaces `error`, so any raw SDK error string would land in the
-      // UI verbatim.
-      const friendlyError = this._friendlyTestError(error, errorAnalysis);
 
       return {
         success: false,
-        error: friendlyError,
+        error: this._friendlyTestError(error, errorAnalysis),
         errorType: errorAnalysis?.type || 'UNKNOWN',
         errorAnalysis,
-        networkConnectivity: await this.checkNetworkConnectivity().catch(() => null)
+        provider: this.activeProvider
       };
     }
+  }
+
+  async _testGeminiConnection() {
+    const networkCheck = await this.checkNetworkConnectivity();
+    const hasNetworkIssues = networkCheck.tests.some(test => !test.success);
+
+    if (hasNetworkIssues) {
+      logger.warn('Network connectivity issues detected', networkCheck);
+    }
+
+    const generationConfig = this.getGenerationConfig({ temperature: 0, maxOutputTokens: 64 });
+    const fallbackModels = config.get('llm.gemini.fallbackModels') || [];
+    const modelsToTry = [this.model, ...fallbackModels];
+
+    let lastError = null;
+    let result = null;
+    let usedModel = null;
+
+    for (const modelName of modelsToTry) {
+      try {
+        const startTime = Date.now();
+        result = await this.client.models.generateContent({
+          model: modelName,
+          contents: 'Test connection. Please respond with "OK".',
+          config: generationConfig
+        });
+        usedModel = modelName;
+        const latency = Date.now() - startTime;
+        const { text } = this.extractTextFromCandidates(result);
+
+        logger.info('Connection test successful', {
+          response: text,
+          latency,
+          model: usedModel,
+          networkCheck: hasNetworkIssues ? 'issues_detected' : 'healthy'
+        });
+
+        return {
+          success: true,
+          response: text,
+          latency,
+          model: usedModel,
+          provider: 'gemini',
+          networkConnectivity: networkCheck
+        };
+      } catch (error) {
+        lastError = error;
+        logger.warn(`Connection test failed for model ${modelName}`, {
+          error: error.message,
+          model: modelName
+        });
+
+        const isModelUnavailable = error.message.includes('503') ||
+          error.message.includes('UNAVAILABLE') ||
+          error.message.includes('high demand') ||
+          error.message.includes('quota') ||
+          error.message.includes('rate limit');
+
+        if (!isModelUnavailable && modelName === this.model) {
+          break;
+        }
+      }
+    }
+
+    throw lastError || new Error('Connection test failed on all models');
+  }
+
+  async _testOpenAIConnection() {
+    const provider = providers.getProvider(this.activeProvider);
+    const startTime = Date.now();
+    const messages = [
+      { role: 'user', content: 'Test connection. Please respond with "OK".' }
+    ];
+
+    const responseText = await this.executeOpenAIRequest(messages);
+    const latency = Date.now() - startTime;
+
+    logger.info('Connection test successful', {
+      response: responseText,
+      latency,
+      model: this.model,
+      provider: this.activeProvider
+    });
+
+    return {
+      success: true,
+      response: responseText,
+      latency,
+      model: this.model,
+      provider: this.activeProvider
+    };
   }
 
   /**
@@ -1510,11 +1793,33 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
   }
 
   updateApiKey(newApiKey) {
-    process.env.GEMINI_API_KEY = newApiKey;
+    const provider = providers.getProvider(this.activeProvider);
+    if (provider) {
+      process.env[provider.apiKeyEnv] = newApiKey;
+    }
     this.isInitialized = false;
     this.initializeClient();
-    
-    logger.info('API key updated and client reinitialized');
+
+    logger.info('API key updated and client reinitialized', {
+      provider: this.activeProvider
+    });
+  }
+
+  switchProvider(providerId) {
+    const provider = providers.getProvider(providerId);
+    if (!provider) {
+      logger.warn('Attempted to switch to unknown provider', { providerId });
+      return;
+    }
+    process.env.LLM_PROVIDER = providerId;
+    this.providerId = providerId;
+    this.isInitialized = false;
+    this.initializeClient();
+
+    logger.info('Switched LLM provider', {
+      provider: providerId,
+      model: this.model
+    });
   }
 
   getStats() {
